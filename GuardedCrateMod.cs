@@ -14,9 +14,9 @@ using Random = UnityEngine.Random;
 
 namespace Oxide.Plugins
 {
-    [Info("Guarded Crate", "Bazz3l", "1.7.0")]
+    [Info("Guarded Crate Modded", "Bazz3l", "1.7.1")]
     [Description("Spawns hackable crate events at random locations guarded by scientists.")]
-    public class GuardedCrate : CovalencePlugin
+    public class GuardedCrateMod : CovalencePlugin
     {
         [PluginReference] Plugin HackableLock, Clans, Kits;
 
@@ -27,8 +27,15 @@ namespace Oxide.Plugins
         private const string CRATE_PREFAB = "assets/prefabs/deployable/chinooklockedcrate/codelockedhackablecrate.prefab";
         private const string MARKER_PREFAB = "assets/prefabs/tools/map/genericradiusmarker.prefab";
         private const string CHUTE_PREFAB = "assets/prefabs/misc/parachute/parachute.prefab";
-        private const string NPC_PREFAB = "assets/rust.ai/agents/npcplayer/humannpc/scientist/scientistnpc_roam.prefab";
         private const string PLANE_PREFAB = "assets/prefabs/npc/cargo plane/cargo_plane.prefab";
+        private const string BRADLEY_PREFAB = "assets/prefabs/npc/m2bradley/bradleyapc.prefab";
+
+        private static readonly string[] NPC_PREFABS = {
+            "assets/rust.ai/agents/npcplayer/humannpc/scientist/scientistnpc_roam.prefab",
+            "assets/rust.ai/agents/npcplayer/humannpc/scientist/scientistnpc_heavy.prefab",
+            "assets/rust.ai/agents/npcplayer/humannpc/scientist/scientistnpc_oilrig.prefab",
+            "assets/rust.ai/agents/npcplayer/humannpc/scientist/scientistnpc_patrol.prefab"
+        };
 
         private readonly int _layers =  Layers.Terrain | Layers.World | Layers.Construction | Layers.Deploy;
         private readonly Dictionary<BaseEntity, CrateEvent> _entities = new Dictionary<BaseEntity, CrateEvent>();
@@ -74,7 +81,7 @@ namespace Oxide.Plugins
         private class PluginConfig
         {
             [JsonProperty("EnableAutoStart (enables events to spawn automatically)")]
-            public bool EnableAutoStart = true;
+            public bool EnableAutoStart = false;
 
             [JsonProperty("EventDuration (time between event spawns)")]
             public float EventDuration = 1800f;
@@ -86,7 +93,7 @@ namespace Oxide.Plugins
             public float SpawnDistanceFromBases = 30f;
 
             [JsonProperty("Command (command name)")]
-            public string[] Command = { "gc" };
+            public string[] Command = { "gcm" };
 
             [JsonProperty("EffectiveWeaponRange (range weapons will be effective)")]
             public Dictionary<string, float> EffectiveWeaponRange = new Dictionary<string, float>
@@ -152,9 +159,9 @@ namespace Oxide.Plugins
                 }
             }
 
-            public static PluginData LoadData() => Interface.Oxide.DataFileSystem.ReadObject<PluginData>("GuardedCrate") ?? new PluginData();
+            public static PluginData LoadData() => Interface.Oxide.DataFileSystem.ReadObject<PluginData>("GuardedCrateMod") ?? new PluginData();
 
-            public void Save() => Interface.Oxide.DataFileSystem.WriteObject("GuardedCrate", this);
+            public void Save() => Interface.Oxide.DataFileSystem.WriteObject("GuardedCrateMod", this);
 
             public EventSetting FindEvent(string name)
             {
@@ -260,7 +267,7 @@ namespace Oxide.Plugins
         {
             lang.RegisterMessages(new Dictionary<string, string>
             {
-                { "InvalidSyntax", "/gc start <name>\n/gc stop" },
+                { "InvalidSyntax", "/gcm start <name>\n/gcm stop\n/gcm me <name>" },
                 { "Prefix", "<color=#5AB5C7>Guarded Crate</color>" },
                 { "Permission", "No permission" },
                 { "CreateEvent", "New event starting stand by." },
@@ -421,6 +428,12 @@ namespace Oxide.Plugins
             new CrateEvent(this).SetupEvent(settings ?? _stored.Events.GetRandom());
         }
 
+        private void StartEventOnPlayer(IPlayer player, string name = null)
+        {
+            var settings = _stored.FindEvent(name);
+            new CrateEvent(this).SetupEventOnPlayer(settings ?? _stored.Events.GetRandom(), player);
+        }
+
         private void StopEvents() => CommunityEntity.ServerInstance.StartCoroutine(DespawnRoutine());
 
         private void RefreshEvents()
@@ -477,6 +490,19 @@ namespace Oxide.Plugins
             return vector;
         }
 
+        private Vector3 GetPlayerPosition(IPlayer player)
+        {
+            BasePlayer _player = player.Object as BasePlayer;
+            
+            // if (!IsValidEventPosition(_player.transform.position))
+            // {
+            //     // TODO: spawn some where _near_ the player instead of random
+            //     return GetPosition();
+            // }
+
+            return _player.transform.position; 
+        }
+
         private Vector3 FindRandomPosition()
         {
             Vector3 vector;
@@ -527,7 +553,14 @@ namespace Oxide.Plugins
         private void LoadMonuments()
         {
             foreach (var monument in UnityEngine.Object.FindObjectsOfType<MonumentInfo>())
-                _monuments.Add(new Monument(monument));
+            {
+                // only load monuments that wouldn't be ideal for encounter (used as blacklist)
+                if (monument.IsSafeZone || monument.name.Contains("cave") || monument.name.Contains("power_sub"))
+                {
+                   _monuments.Add(new Monument(monument));
+                }
+            }
+                
         }
 
         private class Monument
@@ -550,18 +583,19 @@ namespace Oxide.Plugins
         private class CrateEvent
         {
             private readonly HashSet<ScientistNPC> _npcs = new HashSet<ScientistNPC>();
+            private readonly HashSet<BradleyAPC> _apcs = new HashSet<BradleyAPC>();
             private MapMarkerGenericRadius _marker;
             private HackableLockedCrate _crate;
             private Coroutine _coroutine;
             private CargoPlane _plane;
             private Vector3 _position;
             private Timer _timer;
-            private GuardedCrate _plugin;
+            private GuardedCrateMod _plugin;
             private EventSetting _settings;
 
             public EventSetting Settings => _settings;
 
-            public CrateEvent(GuardedCrate plugin)
+            public CrateEvent(GuardedCrateMod plugin)
             {
                 _plugin = plugin;
             }
@@ -572,6 +606,18 @@ namespace Oxide.Plugins
             {
                 _settings = settings;
                 _position = _plugin.GetPosition();
+
+                if (_position == Vector3.zero) return;
+
+                SpawnPlane();
+
+                _plugin?.AddEvent(this);
+            }
+
+            public void SetupEventOnPlayer(EventSetting settings, IPlayer player)
+            {
+                _settings = settings;
+                _position = _plugin.GetPlayerPosition(player);
 
                 if (_position == Vector3.zero) return;
 
@@ -652,6 +698,18 @@ namespace Oxide.Plugins
                 _plugin.DelEntity(player);
             }
 
+            void CacheAdd(BradleyAPC player)
+            {
+                _apcs.Add(player);
+                _plugin.AddEntity(player, this);
+            }
+
+            void CacheRemove(BradleyAPC player)
+            {
+                _apcs.Remove(player);
+                _plugin.DelEntity(player);
+            }
+
             #endregion
 
             #region Plane
@@ -709,6 +767,14 @@ namespace Oxide.Plugins
 
             private IEnumerator SpawnAI()
             {
+                // TODO: spawn apc ONLY if setting is hard or elite
+                var apc_position = FindPointOnNavmesh(_position, 7f);
+
+                if (apc_position is Vector3)
+                    SpawnApc((Vector3)apc_position, Quaternion.LookRotation((Vector3)apc_position - _position));
+                else
+                    Debug.Log("Failed to find position for AI");
+
                 for (var i = 0; i < _settings.NpcCount; i++)
                 {
                     var position = FindPointOnNavmesh(_position, 5f);
@@ -722,9 +788,26 @@ namespace Oxide.Plugins
                 }
             }
 
+            private void SpawnApc(Vector3 position, Quaternion rotation) 
+            {
+                var apc = (BradleyAPC)GameManager.server.CreateEntity(BRADLEY_PREFAB, position, rotation);
+                apc.enableSaving = false;
+                // npc.displayName = _settings.NpcName;
+                // npc.startHealth = _settings.NpcHealth;
+                apc.Spawn();
+                
+                apc.targetList.Clear();
+                apc.ClearPath();
+
+                CacheAdd(apc);
+            }
+
             private void SpawnNpc(Vector3 position, Quaternion rotation)
             {
-                var npc = (ScientistNPC)GameManager.server.CreateEntity(NPC_PREFAB, position, rotation);
+                // random NPC prefab for group diversity
+                var prefab = NPC_PREFABS[Random.Range(0, NPC_PREFABS.Length - 1)];
+
+                var npc = (ScientistNPC)GameManager.server.CreateEntity(prefab, position, rotation);
                 npc.enableSaving = false;
                 npc.displayName = _settings.NpcName;
                 npc.startHealth = _settings.NpcHealth;
@@ -800,58 +883,14 @@ namespace Oxide.Plugins
                 lootItems.Clear();
             }
 
-            #endregion
-
-            #region Cleanup
-
-            private void DespawnCrate(bool completed = false)
-            {
-                if (!IsValid(_crate)) return;
-
-                if (!completed)
+            private void DetermineWinner(BasePlayer player) {
+                if (_npcs.Any(x => x != null && !x.IsDestroyed))
                 {
-                    _crate.Kill();
+                    ResetTimer();
                     return;
                 }
 
-                if (_settings.AutoHack)
-                {
-                    _crate.hackSeconds = HackableLockedCrate.requiredHackSeconds - _settings.AutoHackSeconds;
-                    _crate.StartHacking();
-                }
-
-                _crate.shouldDecay = true;
-                _crate.RefreshDecay();
-            }
-
-            private void DespawnPlane()
-            {
-                if (!IsValid(_plane)) return;
-
-                _plane.Kill();
-            }
-
-            private void DespawnAI()
-            {
-                foreach (var npc in _npcs.ToList())
-                {
-                    if (!IsValid(npc)) continue;
-
-                    npc.Kill();
-                }
-
-                _npcs.Clear();
-            }
-
-            #endregion
-
-            #region Oxide Hooks
-
-            public void OnNPCDeath(ScientistNPC npc, BasePlayer player)
-            {
-                CacheRemove(npc);
-
-                if (_npcs.Any(x => x != null && !x.IsDestroyed))
+                if (_apcs.Any(x => x != null && !x.IsDestroyed))
                 {
                     ResetTimer();
                     return;
@@ -885,11 +924,88 @@ namespace Oxide.Plugins
                 }
             }
 
+            #endregion
+
+            #region Cleanup
+
+            private void DespawnCrate(bool completed = false)
+            {
+                if (!IsValid(_crate)) return;
+
+                if (!completed)
+                {
+                    _crate.Kill();
+                    return;
+                }
+
+                if (_settings.AutoHack)
+                {
+                    _crate.hackSeconds = HackableLockedCrate.requiredHackSeconds - _settings.AutoHackSeconds;
+                    _crate.StartHacking();
+                }
+
+                _crate.shouldDecay = true;
+                _crate.RefreshDecay();
+            }
+
+            private void DespawnPlane()
+            {
+                if (!IsValid(_plane)) return;
+
+                _plane.Kill();
+            }
+
+            private void DespawnAI()
+            {
+                foreach (var apc in _apcs.ToList())
+                {
+                    if (!IsValid(apc)) continue;
+
+                    apc.Kill();
+                }
+
+                _apcs.Clear();
+
+                foreach (var npc in _npcs.ToList())
+                {
+                    if (!IsValid(npc)) continue;
+
+                    npc.Kill();
+                }
+
+                _npcs.Clear();
+            }
+
+            #endregion
+
+            #region Oxide Hooks
+
+            private void OnEntityDeath(BradleyAPC apc, HitInfo info)
+            {
+                CacheRemove(apc);
+                BasePlayer player = info.Initiator as BasePlayer;
+                DetermineWinner(player);
+            }
+
+            public void OnNPCDeath(ScientistNPC npc, BasePlayer player)
+            {
+                CacheRemove(npc);
+                DetermineWinner(player);
+            }
+
             public object OnCanHackCrate()
             {
                 if (_npcs.Count > 0) return false;
 
                 return null;
+            }
+
+            // don't attack fellow NPCs buddys
+            public object CanBradleyApcTarget(BradleyAPC apc, ScientistNPC npc)
+            {
+                // todo: don't interfere with other bradleys on  map (is apc, ours?)
+                //return false;
+                return npc != null && _npcs.Any(x => x.userID == npc.userID) ? (object)false : null;
             }
 
             #endregion
@@ -1211,6 +1327,19 @@ namespace Oxide.Plugins
             player.Message(Lang("CreateEvent", player.Id));
         }
 
+        private void StartEventOnPlayer(IPlayer player, string[] args)
+        {
+            if (args.Length == 0)
+            {
+                player.Message(Lang("InvalidSyntax", player.Id));
+                return;
+            }
+
+            StartEventOnPlayer(player, string.Join(" ", args));
+
+            player.Message(Lang("CreateEvent", player.Id));
+        }
+
         private void StopEvents(IPlayer player)
         {
             StopEvents();
@@ -1237,6 +1366,9 @@ namespace Oxide.Plugins
                     break;
                 case "stop":
                     StopEvents(player);
+                    break;
+                case "me":
+                    StartEventOnPlayer(player, args.Skip(1).ToArray());
                     break;
                 default:
                     player.Message(Lang("InvalidSyntax", player.Id));
